@@ -1,131 +1,88 @@
 require("dotenv").config();
+const path = require("path");
+
 const express = require("express");
 const bodyParser = require("body-parser");
-const { default: mongoose } = require("mongoose");
-const path = require("path");
-const graphqlHttp = require("express-graphql").graphqlHTTP;
-const graphqlSchema = require("./graphql/schema");
-const graphqlResolver = require("./graphql/resolver");
-const auth = require("./middlewares/auth");
-const multer = require("multer");
-const fs = require("fs");
-const hemlet = require("helmet");
-const compression = require("compression");
+const mongoose = require("mongoose");
+const session = require("express-session");
+const MongoDBStore = require("connect-mongodb-session")(session);
+const csrf = require("csurf");
+const flash = require("connect-flash");
+
+const errorController = require("./controllers/error");
+const User = require("./models/user");
+
+const MONGODB_URI = process.env.MONGODB_URI;
 
 const app = express();
-
-const fileStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "images");
-  },
-  filename: (req, file, cb) => {
-    cb(
-      null,
-      new Date().toISOString().replace(/:/g, "-") + "-" + file.originalname,
-    );
-  },
+const store = new MongoDBStore({
+  uri: MONGODB_URI,
+  collection: "sessions",
 });
+const csrfProtection = csrf();
 
-const fileFilter = (req, file, cb) => {
-  if (
-    file.mimetype === "image/png" ||
-    file.mimetype === "image/jpg" ||
-    file.mimetype === "image/jpeg"
-  ) {
-    cb(null, true);
-  } else {
-    cb(null, false);
-  }
-};
+app.set("view engine", "ejs");
+app.set("views", "views");
 
-// app.use(bodyParser.urlencoded()); // x-www-form-urlencoded <form>
-app.use(bodyParser.json()); // application/json
+const adminRoutes = require("./routes/admin");
+const shopRoutes = require("./routes/shop");
+const authRoutes = require("./routes/auth");
 
-// CORS Middleware - Must be before all routes
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.static(path.join(__dirname, "public")));
+app.use(
+  session({
+    secret: "my secret",
+    resave: false,
+    saveUninitialized: false,
+    store: store,
+  })
+);
+app.use(csrfProtection);
+app.use(flash());
+
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "OPTIONS, GET, POST, PUT, PATCH, DELETE",
-  );
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
+  res.locals.isAuthenticated = req.session.isLoggedIn;
+  res.locals.csrfToken = req.csrfToken();
   next();
 });
 
-app.use(
-  multer({ storage: fileStorage, fileFilter: fileFilter }).single("image"),
-);
-app.use("/images", express.static(path.join(__dirname, "images")));
+app.use((req, res, next) => {
+  if (!req.session.user) {
+    return next();
+  }
+  User.findById(req.session.user._id)
+    .then((user) => {
+      if (!user) {
+        return next();
+      }
+      req.user = user;
+      next();
+    })
+    .catch((err) => {
+      throw new Error(err);
+    });
+});
 
-app.use(auth);
+app.use("/admin", adminRoutes);
+app.use(shopRoutes);
+app.use(authRoutes);
 
-app.put("/post-image", (req, res, next) => {
-  if (!req.isAuth) {
-    return res.status(401).json({ message: "Not authenticated!" });
-  }
-  if (!req.file) {
-    return res.status(200).json({ message: "No file provided!" });
-  }
-  console.log("REQ.BODY.OLDPATH", req.file);
-  if (req.body.oldPath) {
-    clearImage(req.body.oldPath);
-  }
-  return res.status(201).json({
-    message: "File stored.",
-    filePath: req.file.path.replace(/\\/g, "/"),
+app.use(errorController.get404);
+
+app.use((error, req, res, next) => {
+  res.status(500).render("500", {
+    pageTitle: "Error!",
+    path: "/500",
+    isAuthenticated: req.session.isLoggedIn,
   });
 });
 
-app.use(
-  "/graphql",
-  graphqlHttp({
-    schema: graphqlSchema,
-    rootValue: graphqlResolver,
-    graphiql: true,
-    customFormatErrorFn(err) {
-      console.log("error", err);
-      if (!err.originalError) {
-        return err;
-      }
-      const data = err.originalError.data;
-      const message = err.message || "An error occurred.";
-      const code = err.originalError.statusCode || 500;
-      return { message: message, status: code, data: data };
-    },
-  }),
-);
-
-app.use(hemlet());
-app.use(compression());
-
-app.use((error, req, res, next) => {
-  console.log(error);
-  if (res.headersSent) {
-    return next(error);
-  }
-  const status = error.statusCode || 500;
-  const message = error.message;
-  const data = error.data;
-  res.status(status).json({ message: message, data: data });
-});
 mongoose
-  .connect(process.env.MONGODB_URI)
+  .connect(MONGODB_URI)
   .then((result) => {
-    app.listen(process.env.PORT || 8080);
-    console.log("Connected to Database and Server is running");
+    app.listen(3000);
   })
   .catch((err) => {
     console.log(err);
   });
-
-const clearImage = (filePath) => {
-  const fullPath = path.join(__dirname, filePath);
-  fs.unlink(fullPath, (err) => {
-    if (err && err.code !== "ENOENT") {
-      console.log(err);
-    }
-  });
-};
